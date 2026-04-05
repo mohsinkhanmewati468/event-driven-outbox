@@ -24,7 +24,6 @@ const connectRabbitMQ = async () => {
 
     channel = await connection.createConfirmChannel();
 
-    // ✅ ONLY EXCHANGE
     await channel.assertExchange(EXCHANGE_NAME, "direct", {
       durable: true,
     });

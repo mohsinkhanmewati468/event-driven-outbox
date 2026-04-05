@@ -105,7 +105,6 @@ const startConsumer = async () => {
 
 startConsumer();
 
-// graceful shutdown
 const shutdown = async () => {
   try {
     logger.info("Shutting down...");

@@ -1,4 +1,3 @@
-// src/models/Outbox.js
 const mongoose = require("mongoose");
 
 const outboxSchema = new mongoose.Schema(

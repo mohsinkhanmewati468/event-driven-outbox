@@ -1,4 +1,3 @@
-const Joi = require("joi");
 const CustomError = require("../utils/custom.error");
 
 const validateBody = (schema) => (req, res, next) => {
