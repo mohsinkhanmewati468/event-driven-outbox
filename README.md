@@ -66,7 +66,7 @@ Welcome Task Created
 ### 1. Clone the repository
 
 ```
-git clone <your-repo-url>
+git clone https://github.com/mohsinkhanmewati468/event-driven-outbox.git
 cd task-assignment
 ```
 
