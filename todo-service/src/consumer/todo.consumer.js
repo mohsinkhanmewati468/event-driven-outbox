@@ -1,106 +1,133 @@
-const amqp = require("amqplib");
 const connectDB = require("../config/db");
 const Todo = require("../models/Todo");
 const logger = require("../utils/logger");
 
-const EXCHANGE_NAME = "user.events";
-const QUEUE_NAME = "USER_REGISTERED";
-const ROUTING_KEY = "user.registered";
-const DLQ_NAME = "USER_REGISTERED_DLQ";
-const MAX_RETRIES = 3;
+const {
+  connectRabbitMQ,
+  getChannel,
+  closeRabbitMQ,
+} = require("../rabbitmq/connection");
 
-let connection;
-let channel;
+const {
+  setupRabbitMQ,
+  QUEUE_NAME,
+  EXCHANGE_NAME,
+  ROUTING_KEY,
+} = require("../rabbitmq/setup");
+
+const MAX_RETRIES = 3;
 
 const startConsumer = async () => {
   try {
     await connectDB();
+    await connectRabbitMQ();
+    await setupRabbitMQ();
 
-    connection = await amqp.connect(process.env.RABBITMQ_URL);
-    channel = await connection.createChannel();
+    const channel = getChannel();
 
-    channel.prefetch(1);
+    logger.info("Todo Service listening...");
 
-    await channel.assertExchange(EXCHANGE_NAME, "direct", {
-      durable: true,
-    });
+    channel.consume(QUEUE_NAME, handleMessage, { noAck: false });
+  } catch (error) {
+    logger.error("Consumer startup failed", error);
 
-    await channel.assertQueue(QUEUE_NAME, {
-      durable: true,
-      arguments: {
-        "x-dead-letter-exchange": "",
-        "x-dead-letter-routing-key": DLQ_NAME,
-      },
-    });
-
-    await channel.assertQueue(DLQ_NAME, {
-      durable: true,
-    });
-
-    await channel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY);
-
-    logger.info("Todo Service listening (exchange mode)...");
-
-    channel.consume(
-      QUEUE_NAME,
-      async (msg) => {
-        if (!msg) return;
-
-        const data = JSON.parse(msg.content.toString());
-        const { userId } = data;
-
-        try {
-          logger.info("Received message", data);
-
-          await Todo.updateOne(
-            { userId, title: "Welcome to the App" },
-            {
-              $setOnInsert: {
-                userId,
-                title: "Welcome to the App",
-              },
-            },
-            { upsert: true },
-          );
-
-          logger.info(`Welcome task ensured for user ${userId}`);
-
-          channel.ack(msg);
-        } catch (err) {
-          const retries = msg.properties.headers?.retries || 0;
-
-          logger.error("Error processing message", {
-            userId,
-            retries,
-            error: err.message,
-          });
-
-          if (retries >= MAX_RETRIES) {
-            logger.error("Max retries reached → DLQ");
-
-            channel.nack(msg, false, false);
-          } else {
-            logger.warn(`Retrying (${retries + 1})`);
-
-            channel.publish(EXCHANGE_NAME, ROUTING_KEY, msg.content, {
-              persistent: true,
-              headers: {
-                retries: retries + 1,
-              },
-            });
-
-            channel.ack(msg);
-          }
-        }
-      },
-      { noAck: false },
-    );
-  } catch (err) {
-    logger.error("Consumer failed", err);
-
-    // retry connection
+    // retry startup
     setTimeout(startConsumer, 5000);
   }
+};
+
+const handleMessage = async (msg) => {
+  if (!msg) return;
+
+  const channel = getChannel(); //always fresh
+
+  try {
+    const data = parseMessage(msg);
+    if (!data) return ack(channel, msg);
+
+    const { userId } = data;
+
+    if (!userId) {
+      logger.error("Missing userId → discarding message", data);
+      return ack(channel, msg);
+    }
+
+    await processTodo(userId);
+
+    logger.info(`Welcome task ensured for user ${userId}`);
+
+    ack(channel, msg);
+  } catch (error) {
+    await handleProcessingError(channel, msg, error);
+  }
+};
+
+const parseMessage = (msg) => {
+  try {
+    return JSON.parse(msg.content.toString());
+  } catch (error) {
+    logger.error("Invalid JSON → discarding message", {
+      error: error.message,
+    });
+    return null;
+  }
+};
+
+//Create todo (idempotent)
+const processTodo = async (userId) => {
+  return Todo.updateOne(
+    { userId, title: "Welcome to the App" },
+    {
+      $setOnInsert: {
+        userId,
+        title: "Welcome to the App",
+      },
+    },
+    { upsert: true },
+  );
+};
+
+const handleProcessingError = async (channel, msg, error) => {
+  const data = safeParse(msg);
+  const retries = msg.properties.headers?.retries || 0;
+
+  logger.error("Processing failed", {
+    userId: data?.userId,
+    retries,
+    error: error.message,
+  });
+
+  if (retries >= MAX_RETRIES) {
+    logger.error("Max retries reached → DLQ");
+    return channel.nack(msg, false, false);
+  }
+
+  try {
+    channel.publish(EXCHANGE_NAME, ROUTING_KEY, msg.content, {
+      persistent: true,
+      headers: { retries: retries + 1 },
+    });
+
+    ack(channel, msg);
+
+    logger.warn(`retrying (${retries + 1})`);
+  } catch (pubError) {
+    logger.error("Retry publish failed → will re-deliver", {
+      error: pubError.message,
+    });
+  }
+};
+
+const safeParse = (msg) => {
+  try {
+    return JSON.parse(msg.content.toString());
+  } catch {
+    return null;
+  }
+};
+
+const ack = (channel, msg) => {
+  channel.ack(msg);
 };
 
 startConsumer();
@@ -108,13 +135,10 @@ startConsumer();
 const shutdown = async () => {
   try {
     logger.info("Shutting down...");
-
-    if (channel) await channel.close();
-    if (connection) await connection.close();
-
+    await closeRabbitMQ();
     process.exit(0);
-  } catch (err) {
-    logger.error("Shutdown error", err);
+  } catch (error) {
+    logger.error("Shutdown error", error);
     process.exit(1);
   }
 };
